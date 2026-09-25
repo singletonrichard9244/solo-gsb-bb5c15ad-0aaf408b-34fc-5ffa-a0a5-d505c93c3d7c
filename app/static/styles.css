@@ -380,6 +380,7 @@ body {
   background: #e2e8f0; border-radius: 4px; overflow: hidden; vertical-align: middle;
 }
 .ledger-cov-bar { display: block; height: 100%; background: var(--primary); }
+.cons-bad { color: #b91c1c; }
 .toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
   background: #0f172a; color: #fff; padding: 9px 16px; border-radius: 8px;

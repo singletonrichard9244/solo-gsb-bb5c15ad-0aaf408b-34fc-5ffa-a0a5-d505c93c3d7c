@@ -33,6 +33,9 @@ const state = {
   auditDevice: "",
   auditMetric: "",
   auditResult: null,
+  consKey1: "", // "device\x00metric"
+  consKey2: "",
+  consResult: null,
   imports: [],
 };
 
@@ -1446,6 +1449,130 @@ function renderSamplingAudit() {
   }
 }
 
+/* --------------------- redundant-channel consistency --------------------- */
+
+function consChannelOptions() {
+  return state.channels
+    .slice()
+    .sort((a, b) => (a.device + a.metric).localeCompare(b.device + b.metric));
+}
+
+function consKey(ch) { return `${ch.device}\x00${ch.metric}`; }
+
+function renderConsistencyChannels() {
+  const all = consChannelOptions();
+  const keys = all.map(consKey);
+  const valid1 = keys.includes(state.consKey1);
+  const valid2 = keys.includes(state.consKey2);
+  if (!valid1) state.consKey1 = keys[0] || "";
+  // default the second picker to a different channel when possible
+  if (!valid2 || state.consKey2 === state.consKey1) {
+    state.consKey2 = keys.find((k) => k !== state.consKey1) || "";
+  }
+
+  const fillGroup = (devSelId, metSelId, selectedKey) => {
+    const [selDevice, selMetric] = selectedKey ? selectedKey.split("\x00") : ["", ""];
+    const devices = [...new Set(all.map((c) => c.device))].sort();
+    $(devSelId).innerHTML = devices.map((d) =>
+      `<option value="${esc(d)}"${d === selDevice ? " selected" : ""}>${esc(d)}</option>`).join("");
+    const metrics = all.filter((c) => c.device === selDevice).map((c) => c.metric).sort();
+    $(metSelId).innerHTML = metrics.map((m) =>
+      `<option value="${esc(m)}"${m === selMetric ? " selected" : ""}>${esc(m)}</option>`).join("");
+  };
+  fillGroup("cons-device-1", "cons-metric-1", state.consKey1);
+  fillGroup("cons-device-2", "cons-metric-2", state.consKey2);
+}
+
+function consSelectedKey(group) {
+  const device = $(`cons-device-${group}`).value;
+  const metric = $(`cons-metric-${group}`).value;
+  return device && metric ? `${device}\x00${metric}` : "";
+}
+
+function fillConsistencyRange() {
+  ensureView();
+  if (typeof state.viewStart === "number" && isFinite(state.viewStart)) {
+    $("cons-start").value = toLocalInput(state.viewStart);
+  }
+  if (typeof state.viewEnd === "number" && isFinite(state.viewEnd)) {
+    $("cons-end").value = toLocalInput(state.viewEnd);
+  }
+}
+
+async function runChannelConsistency() {
+  const k1 = consSelectedKey(1);
+  const k2 = consSelectedKey(2);
+  const s = fromLocalInput($("cons-start").value);
+  const e = fromLocalInput($("cons-end").value);
+  const threshold = Number($("cons-threshold").value);
+  if (!k1 || !k2) { toast("请先选择两条已导入事件的通道", true); return; }
+  if (k1 === k2) { toast("请选择两条不同的通道", true); return; }
+  if (s === null || e === null || e <= s) { toast("请填写有效的起始/结束 UTC 时间（半开区间，结束须晚于起始）", true); return; }
+  if (!Number.isFinite(threshold) || threshold < 0) { toast("绝对差阈值必须是非负有限数", true); return; }
+  const [d1, m1] = k1.split("\x00");
+  const [d2, m2] = k2.split("\x00");
+  const params = new URLSearchParams({
+    device_1: d1, metric_1: m1, device_2: d2, metric_2: m2,
+    start: s, end: e, diff_threshold: threshold,
+  });
+  const btn = $("btn-cons-query");
+  btn.disabled = true;
+  try {
+    state.consResult = await api(`/api/channel-consistency?${params}`);
+    renderChannelConsistency();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function consSampleHtml(sample) {
+  return `${fmtTime(sample.ts)}<br /><b>${fmtNum(sample.value)}</b>`;
+}
+
+function renderChannelConsistency() {
+  const r = state.consResult;
+  const summary = $("cons-summary");
+  const wrap = $("cons-table-wrap");
+  if (!r) {
+    summary.hidden = true;
+    wrap.hidden = true;
+    return;
+  }
+  summary.hidden = false;
+  summary.innerHTML = `
+    <div class="ledger-line"><b>通道一：</b><span class="tag">${esc(r.channel_1.device)}/${esc(r.channel_1.metric)}</span>
+      <span class="muted small">TTL ${r.channel_1.ttl_seconds === null ? "未配置（保持到下一样本）" : fmtNum(r.channel_1.ttl_seconds) + " 秒"}</span>
+      <b>通道二：</b><span class="tag">${esc(r.channel_2.device)}/${esc(r.channel_2.metric)}</span>
+      <span class="muted small">TTL ${r.channel_2.ttl_seconds === null ? "未配置（保持到下一样本）" : fmtNum(r.channel_2.ttl_seconds) + " 秒"}</span></div>
+    <div class="ledger-line"><b>核查范围：</b>${fmtTime(r.start)} → ${fmtTime(r.end)}
+      （半开 · ${fmtDur(r.end - r.start)}）· 绝对差阈值 ${fmtNum(r.threshold)}（严格大于判不一致）· 全局数据终点 ${fmtTime(r.horizon)}</div>
+    <div class="ledger-line"><b>可比秒数（两通道同时有效）：</b>${fmtDur(r.comparable_seconds)}
+      · <b class="cons-bad">不一致秒数：${fmtDur(r.inconsistent_seconds)}</b>
+      · 一致秒数 ${fmtDur(r.consistent_seconds)}
+      · 不一致占比 <b>${fmtPct(r.inconsistency_rate)}</b>
+      · 不一致片段 <b>${r.segment_count}</b> 个
+      <span class="muted small">（任一方到期空档不计入可比秒数，也不外推）</span></div>`;
+
+  const rows = $("cons-rows");
+  if (r.segments.length) {
+    rows.innerHTML = r.segments.map((seg, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td>${fmtTime(seg.start)}</td>
+        <td>${fmtTime(seg.end)}</td>
+        <td>${fmtDur(seg.duration_seconds)}</td>
+        <td><b class="cons-bad">${fmtNum(seg.max_diff)}</b></td>
+        <td>${consSampleHtml(seg.channel_1_sample)}</td>
+        <td>${consSampleHtml(seg.channel_2_sample)}</td>
+      </tr>`).join("");
+  } else {
+    rows.innerHTML = `<tr><td colspan="7" class="empty">无不一致片段：两通道同时有效期间绝对差均不超过阈值。</td></tr>`;
+  }
+  wrap.hidden = false;
+}
+
 /* ----------------------------- annotations ----------------------------- */
 
 function renderAnnotations() {
@@ -1623,9 +1750,12 @@ async function reloadAll() {
   renderTtls();
   renderLedgerRules();
   renderAuditChannels();
+  renderConsistencyChannels();
   if (!$("ledger-start").value || !$("ledger-end").value) fillLedgerRange();
   if (!$("audit-start").value || !$("audit-end").value) fillAuditRange();
   if (state.auditResult) renderSamplingAudit();
+  if (!$("cons-start").value || !$("cons-end").value) fillConsistencyRange();
+  if (state.consResult) renderChannelConsistency();
   syncFilterInputs();
   state.eventOffset = 0;
   await loadEvents(false);
@@ -1821,6 +1951,24 @@ function bind() {
   });
   $("btn-audit-query").addEventListener("click", runSamplingAudit);
   $("btn-audit-fill").addEventListener("click", fillAuditRange);
+
+  [1, 2].forEach((group) => {
+    $(`cons-device-${group}`).addEventListener("change", () => {
+      const keyField = group === 1 ? "consKey1" : "consKey2";
+      state[keyField] = consSelectedKey(group);
+      renderConsistencyChannels();
+    });
+    $(`cons-metric-${group}`).addEventListener("change", () => {
+      const keyField = group === 1 ? "consKey1" : "consKey2";
+      state[keyField] = consSelectedKey(group);
+    });
+  });
+  $("btn-cons-query").addEventListener("click", runChannelConsistency);
+  $("btn-cons-swap").addEventListener("click", () => {
+    [state.consKey1, state.consKey2] = [state.consKey2, state.consKey1];
+    renderConsistencyChannels();
+  });
+  $("btn-cons-fill").addEventListener("click", fillConsistencyRange);
 
   $("brush-save").addEventListener("click", saveBrush);
   $("brush-cancel").addEventListener("click", () => { $("brush-pop").hidden = true; state.brush = null; });

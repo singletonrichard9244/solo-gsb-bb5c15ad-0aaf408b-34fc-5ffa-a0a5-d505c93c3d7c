@@ -9,11 +9,13 @@ from collections import defaultdict
 
 from . import db
 from .audit import audit_cadence
+from .consistency import channel_consistency
 from .engine import (
     Condition,
     Event,
     Interval,
     MaintenanceWindow,
+    channel_value_segments,
     cluster_intervals,
     daily_fault_ledger,
     diff_faults,
@@ -851,6 +853,95 @@ def query_sampling_audit(
         "min_ts": channel["min_ts"],
         "max_ts": channel["max_ts"],
     }
+    return payload
+
+
+def query_channel_consistency(
+    device_1: str,
+    metric_1: str,
+    device_2: str,
+    metric_2: str,
+    start: float,
+    end: float,
+    threshold: float,
+) -> dict:
+    """Read-only redundant-channel consistency check inside ``[start, end)``.
+
+    The two channels must be distinct existing channels.  Each channel's
+    samples are expanded into held-value pieces with its own configured TTL
+    and the *global* data horizon (maximum event timestamp of the whole
+    dataset), including the last sample before ``start`` whose piece is still
+    valid at the window start.  Comparison happens only where both channels
+    simultaneously hold a value (see :func:`app.consistency.channel_consistency`).
+
+    The query reads the current ``events`` / ``channel_ttls`` tables
+    immediately: nothing is written, no fault result is created or rewritten,
+    and rule evaluation is never triggered.
+
+    Raises ``KeyError`` when a channel has no events and ``ValueError`` for an
+    invalid window / threshold or for choosing the same channel twice.
+    """
+    c1 = (str(device_1).strip(), str(metric_1).strip())
+    c2 = (str(device_2).strip(), str(metric_2).strip())
+    if not all(c1) or not all(c2):
+        raise ValueError("two channels (device + metric each) are required")
+    if c1 == c2:
+        raise ValueError("请选择两条不同的通道进行一致性核查")
+    start = float(start)
+    end = float(end)
+    threshold = float(threshold)
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        raise ValueError("consistency end must be greater than start (half-open [start, end))")
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("diff threshold must be a finite non-negative absolute difference")
+
+    horizon_row = db.query_one("SELECT MAX(ts) AS hi FROM events")
+    horizon = horizon_row["hi"] if horizon_row is not None else None
+    if horizon is None:
+        raise KeyError("channel not found: no events imported yet")
+
+    ttl_by_channel = _load_channel_ttls()
+
+    def load_channel(channel: tuple[str, str]) -> tuple[list[Event], dict]:
+        device, metric = channel
+        count_row = db.query_one(
+            "SELECT COUNT(*) AS c, MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM events"
+            " WHERE device = ? AND metric = ? AND value IS NOT NULL",
+            (device, metric),
+        )
+        if count_row is None or count_row["c"] == 0:
+            raise KeyError(f"channel not found: {device}/{metric}")
+        # ts < end: a sample taken exactly at the half-open end only starts
+        # holding at `end`, which is outside the window.  Earlier samples —
+        # including the last one still valid at `start` — are all needed.
+        rows = db.query(
+            "SELECT id, device, metric, ts, value FROM events"
+            " WHERE device = ? AND metric = ? AND value IS NOT NULL AND ts < ?"
+            " ORDER BY ts, id",
+            (device, metric, end),
+        )
+        events = [
+            Event(id=r["id"], device=r["device"], metric=r["metric"], ts=r["ts"], value=r["value"])
+            for r in rows
+        ]
+        pieces = channel_value_segments(events, horizon, ttl=ttl_by_channel.get(channel))
+        info = {
+            "device": device,
+            "metric": metric,
+            "event_count": count_row["c"],
+            "min_ts": count_row["min_ts"],
+            "max_ts": count_row["max_ts"],
+            "ttl_seconds": ttl_by_channel.get(channel),
+        }
+        return pieces, info
+
+    pieces_1, info_1 = load_channel(c1)
+    pieces_2, info_2 = load_channel(c2)
+    result = channel_consistency(pieces_1, pieces_2, start, end, threshold)
+    payload = result.to_dict()
+    payload["channel_1"] = info_1
+    payload["channel_2"] = info_2
+    payload["horizon"] = horizon
     return payload
 
 

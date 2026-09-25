@@ -493,6 +493,51 @@ def get_sampling_audit(
 
 
 # --------------------------------------------------------------------------- #
+# Redundant-channel consistency check (read-only)
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/channel-consistency")
+def get_channel_consistency(
+    device_1: str = Query(..., min_length=1),
+    metric_1: str = Query(..., min_length=1),
+    device_2: str = Query(..., min_length=1),
+    metric_2: str = Query(..., min_length=1),
+    start: str = Query(...),
+    end: str = Query(...),
+    diff_threshold: float = Query(..., ge=0),
+) -> dict:
+    """Read-only consistency check between two different existing channels.
+
+    Samples are expanded into held-value pieces with each channel's TTL and
+    the global data horizon (the last sample still valid at ``start`` is
+    carried in); values are compared only where both channels hold at the
+    same time, never extrapolated into an expired gap.  Pieces with an
+    absolute difference strictly greater than ``diff_threshold`` form
+    inconsistency segments (touching pieces merge), each reporting its
+    duration, maximum difference and the two witnessing samples; totals give
+    comparable vs. inconsistent seconds.  The query reads the current events
+    on demand — it writes nothing and never triggers rule re-evaluation.
+    """
+    start_ts = parse_bound(start)
+    end_ts = parse_bound(end)
+    if start_ts is None or end_ts is None:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    if not math.isfinite(diff_threshold):
+        raise HTTPException(
+            status_code=400, detail="diff_threshold must be a finite non-negative number"
+        )
+    try:
+        return services.query_channel_consistency(
+            device_1, metric_1, device_2, metric_2, start_ts, end_ts, diff_threshold
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
 # Annotations
 # --------------------------------------------------------------------------- #
 

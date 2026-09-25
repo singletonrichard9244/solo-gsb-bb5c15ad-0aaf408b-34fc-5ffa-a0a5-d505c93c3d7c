@@ -402,32 +402,35 @@ class RuleEvaluation:
     suppressed: list[SuppressedSegment] = field(default_factory=list)
 
 
-def channel_held_intervals(
-    events: list[Event],
-    condition: Condition,
-    horizon: float,
-    ttl: float | None = None,
-) -> tuple[list[Interval], list[Event]]:
-    """Return ([start,end) intervals where the predicate held], witnessing events).
+@dataclass(frozen=True)
+class HeldValue:
+    """One maximal half-open piece ``[start, end)`` on which a channel holds
+    the value of the sample taken at ``sample_ts`` (carrying ``event_id``).
 
-    A sample's value is held on ``[sample.ts, next_sample.ts)``; the last sample
-    is held through ``horizon`` (the timestamp of the newest event in the whole
-    dataset). Equal timestamps keep the last supplied value.
+    Pieces already honor the channel's TTL cap (``sample_ts + ttl``) and the
+    global ``horizon``; stretches between two pieces (or before the first one)
+    are invalid gaps where the channel holds nothing.  Touching pieces
+    (``[a,b)`` followed by ``[b,c)``) are consecutive, not gapped.
+    """
 
-    When ``ttl`` is a positive number of seconds, the hold is capped:
-    ``[sample.ts, min(next_sample.ts, sample.ts + ttl, horizon))``.  Whatever
-    remains after the cap is an *invalid gap* (no held value at all), so the
-    condition drops out of AND/OR combinations there and any truth interruption
-    makes the sustained duration re-accumulate from scratch.
+    start: float
+    end: float
+    sample_ts: float
+    value: float
+    event_id: int | None = None
 
-    When the condition carries a ``reset_threshold`` the predicate becomes a
-    latch evaluated in held-interval order: it first arms only on a value
-    satisfying the original comparison, then stays armed through values inside
-    the hysteresis band, and disarms only when a value reaches the reset
-    boundary (high trigger: ``value <= reset``; low trigger:
-    ``value >= reset``).  An invalid TTL gap disarms the latch as well, so the
-    next valid sample must re-cross the original trigger before anything is
-    held again.
+
+def channel_value_segments(
+    events: list[Event], horizon: float, ttl: float | None = None
+) -> list[HeldValue]:
+    """Expand a channel's samples into the half-open pieces on which each
+    sample's value is held (no predicate involved).
+
+    A sample at ``tᵢ`` holds its value on
+    ``[tᵢ, min(tᵢ₊₁, tᵢ + ttl, horizon))``; equal timestamps keep the last
+    supplied value.  Without a TTL the last sample holds through ``horizon``;
+    with a TTL its hold ends at ``min(tᵢ + ttl, horizon)`` and the stretch
+    after it is an invalid gap.  Zero-length pieces are dropped.
     """
     ttl = float(ttl) if ttl is not None else None
     if ttl is not None and ttl <= 0:
@@ -440,33 +443,77 @@ def channel_held_intervals(
         else:
             ordered.append(ev)
 
-    held: list[Interval] = []
-    witnesses: list[Event] = []
-    latched = False
-    prev_end: float | None = None
+    pieces: list[HeldValue] = []
     for i, ev in enumerate(ordered):
         seg_end = ordered[i + 1].ts if i + 1 < len(ordered) else horizon
         if ttl is not None:
             seg_end = min(seg_end, ev.ts + ttl, horizon)
-        # A positive stretch between the previous held piece and this
-        # sample's timestamp means the previous value expired (TTL gap): the
-        # channel holds nothing in between, so the latch re-arms from scratch.
-        if prev_end is not None and ev.ts > prev_end:
-            latched = False
         if seg_end <= ev.ts:
-            prev_end = seg_end
             continue
+        pieces.append(
+            HeldValue(start=ev.ts, end=seg_end, sample_ts=ev.ts, value=ev.value, event_id=ev.id)
+        )
+    return pieces
+
+
+def channel_held_intervals(
+    events: list[Event],
+    condition: Condition,
+    horizon: float,
+    ttl: float | None = None,
+) -> tuple[list[Interval], list[Event]]:
+    """Return ([start,end) intervals where the predicate held], witnessing events).
+
+    Each sample's value is held per :func:`channel_value_segments`
+    (``[sample.ts, min(next sample.ts, sample.ts + ttl, horizon))``; the last
+    sample holds through ``horizon`` without a TTL); equal timestamps keep the
+    last supplied value.
+
+    When ``ttl`` is a positive number of seconds the stretch after a TTL cap
+    is an *invalid gap* (no held value at all), so the condition drops out of
+    AND/OR combinations there and any truth interruption makes the sustained
+    duration re-accumulate from scratch.
+
+    When the condition carries a ``reset_threshold`` the predicate becomes a
+    latch evaluated in held-piece order: it first arms only on a value
+    satisfying the original comparison, then stays armed through values inside
+    the hysteresis band, and disarms only when a value reaches the reset
+    boundary (high trigger: ``value <= reset``; low trigger:
+    ``value >= reset``).  An invalid TTL gap disarms the latch as well, so the
+    next valid sample must re-cross the original trigger before anything is
+    held again.
+    """
+    pieces = channel_value_segments(events, horizon, ttl=ttl)
+
+    held: list[Interval] = []
+    witnesses: list[Event] = []
+    latched = False
+    prev_end: float | None = None
+    for piece in pieces:
+        # A positive stretch between the previous held piece and this
+        # piece's sample timestamp means the previous value expired (TTL
+        # gap): the channel holds nothing in between, so the latch re-arms.
+        if prev_end is not None and piece.sample_ts > prev_end:
+            latched = False
         if condition.reset_threshold is not None:
             if not latched:
-                latched = compare(ev.value, condition.op, condition.threshold)
-            elif at_reset_boundary(ev.value, condition.op, condition.reset_threshold):
+                latched = compare(piece.value, condition.op, condition.threshold)
+            elif at_reset_boundary(piece.value, condition.op, condition.reset_threshold):
                 latched = False
         else:
-            latched = compare(ev.value, condition.op, condition.threshold)
+            latched = compare(piece.value, condition.op, condition.threshold)
         if latched:
-            held.append(Interval(ev.ts, seg_end))
-            witnesses.append(ev)
-        prev_end = seg_end
+            held.append(Interval(piece.start, piece.end))
+            witnesses.append(
+                Event(
+                    id=piece.event_id if piece.event_id is not None else -1,
+                    device=condition.device,
+                    metric=condition.metric,
+                    ts=piece.sample_ts,
+                    value=piece.value,
+                )
+            )
+        prev_end = piece.end
     return union(held), witnesses
 
 

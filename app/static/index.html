@@ -323,6 +323,60 @@
       </section>
 
       <section class="card">
+        <div class="card-head">
+          <h2>冗余通道一致性核查</h2>
+          <span class="muted small">只读 · 即时读取 events，不写入故障结果或触发重算</span>
+        </div>
+        <div class="muted small ledger-hint">
+          从已有通道选择<b>两条不同通道</b>，输入 <b>UTC 半开时间范围</b> <code>[start, end)</code> 与
+          <b>非负绝对差阈值</b>。按各通道样本采样时刻展开持值区间（沿用通道自己的<b>采样有效期 TTL</b> 与
+          <b>全局数据终点</b>，范围起点前仍有效的最后一个样本会被带入）；仅在两通道<b>同时有效</b>的交集上比较，
+          任一方到期的空档不外推。绝对差<b>严格大于</b>阈值形成不一致片段，首尾相接的片段合并；
+          汇总给出可比秒数（两通道同时有效）与不一致秒数。
+        </div>
+        <div class="ledger-form">
+          <label class="ledger-field">通道一 · 设备
+            <select id="cons-device-1"></select>
+          </label>
+          <label class="ledger-field">通道一 · 指标
+            <select id="cons-metric-1"></select>
+          </label>
+          <label class="ledger-field">通道二 · 设备
+            <select id="cons-device-2"></select>
+          </label>
+          <label class="ledger-field">通道二 · 指标
+            <select id="cons-metric-2"></select>
+          </label>
+        </div>
+        <div class="ledger-form">
+          <label class="ledger-field">起始（本机时区） <input type="datetime-local" id="cons-start" step="1" /></label>
+          <label class="ledger-field">结束（本机时区） <input type="datetime-local" id="cons-end" step="1" /></label>
+          <label class="ledger-field">绝对差阈值（≥ 0，严格大于判不一致） <input id="cons-threshold" type="number" min="0" step="any" value="0" /></label>
+          <button id="btn-cons-query" class="btn btn-small btn-primary">核查</button>
+          <button id="btn-cons-swap" class="btn btn-small">交换两通道</button>
+          <button id="btn-cons-fill" class="btn btn-small">填入当前筛选范围</button>
+        </div>
+        <div class="muted small">时间在本机时区输入、按 UTC 查询；不一致判据为 <code>|通道一值 − 通道二值| &gt; 阈值</code>（取等号不算）。</div>
+        <div id="cons-summary" class="ledger-summary" hidden></div>
+        <div id="cons-table-wrap" class="ledger-table-wrap" hidden>
+          <table class="data-table ledger-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>片段开始（UTC）</th>
+                <th>片段结束（UTC）</th>
+                <th>持续秒数</th>
+                <th>最大绝对差</th>
+                <th>通道一样本（时间 / 值）</th>
+                <th>通道二样本（时间 / 值）</th>
+              </tr>
+            </thead>
+            <tbody id="cons-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
         <div class="card-head"><h2>区间标注</h2><span id="anno-count" class="muted"></span></div>
         <div id="anno-list"></div>
       </section>
