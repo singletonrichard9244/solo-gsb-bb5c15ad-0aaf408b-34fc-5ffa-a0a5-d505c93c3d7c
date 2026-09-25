@@ -493,6 +493,50 @@ def get_sampling_audit(
 
 
 # --------------------------------------------------------------------------- #
+# Redundant-channel consistency check (read-only)
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/consistency-check")
+def get_consistency_check(
+    device_a: str = Query(..., min_length=1),
+    metric_a: str = Query(..., min_length=1),
+    device_b: str = Query(..., min_length=1),
+    metric_b: str = Query(..., min_length=1),
+    start: str = Query(...),
+    end: str = Query(...),
+    threshold: float = Query(..., ge=0),
+) -> dict:
+    """Read-only consistency check between two different existing channels.
+
+    Over the half-open UTC window ``[start, end)`` both channels' samples
+    are expanded into held intervals (per-channel TTL and the global data
+    endpoint apply; the last sample before ``start`` counts while still
+    valid) and compared only where both sides hold a value — expired gaps
+    are never extrapolated.  Stretches with absolute difference strictly
+    greater than ``threshold`` merge into inconsistent segments, each
+    reporting start/end, duration, the maximum difference and the two
+    samples behind it; comparable and inconsistent seconds are totalled.
+    The check reads the current events only — it never writes fault results
+    or triggers rule re-evaluation.
+    """
+    start_ts = parse_bound(start)
+    end_ts = parse_bound(end)
+    if start_ts is None or end_ts is None:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    if not math.isfinite(threshold):
+        raise HTTPException(status_code=400, detail="threshold must be a finite non-negative number")
+    try:
+        return services.query_channel_consistency(
+            device_a, metric_a, device_b, metric_b, start_ts, end_ts, threshold
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
 # Annotations
 # --------------------------------------------------------------------------- #
 

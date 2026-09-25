@@ -9,6 +9,7 @@ from collections import defaultdict
 
 from . import db
 from .audit import audit_cadence
+from .consistency import check_consistency
 from .engine import (
     Condition,
     Event,
@@ -850,6 +851,122 @@ def query_sampling_audit(
         "event_count": channel["c"],
         "min_ts": channel["min_ts"],
         "max_ts": channel["max_ts"],
+    }
+    return payload
+
+
+def _channel_samples_for_window(
+    device: str, metric: str, start: float, end: float
+) -> list[tuple[float, float]]:
+    """Samples shaping a channel's held values over the window ``[start, end)``.
+
+    Every sample inside the window plus the **last sample before the window
+    start** — that sample's held interval may still reach into the window
+    (an expired one clips away later), and older samples never can because
+    their held interval ends at the next sample's timestamp at the latest.
+    """
+    before = db.query_one(
+        "SELECT ts, value FROM events"
+        " WHERE device = ? AND metric = ? AND value IS NOT NULL AND ts < ?"
+        " ORDER BY ts DESC, id DESC LIMIT 1",
+        (device, metric, start),
+    )
+    rows = db.query(
+        "SELECT ts, value FROM events"
+        " WHERE device = ? AND metric = ? AND value IS NOT NULL AND ts >= ? AND ts < ?"
+        " ORDER BY ts, id",
+        (device, metric, start, end),
+    )
+    samples = [(r["ts"], r["value"]) for r in rows]
+    if before is not None:
+        samples.insert(0, (before["ts"], before["value"]))
+    return samples
+
+
+def query_channel_consistency(
+    device_a: str,
+    metric_a: str,
+    device_b: str,
+    metric_b: str,
+    start: float,
+    end: float,
+    threshold: float,
+) -> dict:
+    """Read-only consistency check between two existing (redundant) channels.
+
+    Both channels' samples are expanded into held intervals over the
+    half-open window ``[start, end)`` — honouring each channel's configured
+    sample validity period (TTL) and the global data endpoint, and including
+    the last sample before ``start`` while it is still valid — then compared
+    only where both sides hold a value (see
+    :func:`app.consistency.check_consistency`).  The query reads the current
+    events on the fly: it never writes fault results and never triggers rule
+    re-evaluation.
+
+    Raises ``KeyError`` when either channel has no events and ``ValueError``
+    for identical channels or an invalid window / threshold.
+    """
+    device_a = device_a.strip()
+    metric_a = metric_a.strip()
+    device_b = device_b.strip()
+    metric_b = metric_b.strip()
+    if not device_a or not metric_a or not device_b or not metric_b:
+        raise ValueError("both channels (device + metric) are required")
+    if (device_a, metric_a) == (device_b, metric_b):
+        raise ValueError("consistency check requires two different channels")
+    start = float(start)
+    end = float(end)
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        raise ValueError("check end must be greater than start (half-open [start, end))")
+    threshold = float(threshold)
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("threshold must be a finite non-negative number")
+
+    def channel_info(device: str, metric: str) -> dict:
+        row = db.query_one(
+            "SELECT COUNT(*) AS c, MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM events"
+            " WHERE device = ? AND metric = ?",
+            (device, metric),
+        )
+        if row is None or row["c"] == 0:
+            raise KeyError(f"channel not found: {device}/{metric}")
+        return row
+
+    info_a = channel_info(device_a, metric_a)
+    info_b = channel_info(device_b, metric_b)
+
+    horizon_row = db.query_one("SELECT MAX(ts) AS hi FROM events")
+    horizon = horizon_row["hi"] if horizon_row and horizon_row["hi"] is not None else 0.0
+
+    ttl_a = db.fetch_channel_ttl(device_a, metric_a)
+    ttl_b = db.fetch_channel_ttl(device_b, metric_b)
+
+    result = check_consistency(
+        _channel_samples_for_window(device_a, metric_a, start, end),
+        _channel_samples_for_window(device_b, metric_b, start, end),
+        horizon,
+        start,
+        end,
+        threshold,
+        ttl_a=ttl_a["ttl_seconds"] if ttl_a else None,
+        ttl_b=ttl_b["ttl_seconds"] if ttl_b else None,
+    )
+    payload = result.to_dict()
+    payload["channel_a"] = {
+        "device": device_a,
+        "metric": metric_a,
+        "ttl_seconds": ttl_a["ttl_seconds"] if ttl_a else None,
+        "event_count": info_a["c"],
+        "min_ts": info_a["min_ts"],
+        "max_ts": info_a["max_ts"],
+    }
+    payload["channel_b"] = {
+        "device": device_b,
+        "metric": metric_b,
+        "ttl_seconds": ttl_b["ttl_seconds"] if ttl_b else None,
+        "event_count": info_b["c"],
+        "min_ts": info_b["min_ts"],
+        "max_ts": info_b["max_ts"],
     }
     return payload
 
